@@ -1,0 +1,120 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#include "tensorrt_execution_provider_data_transfer.h"
+
+#include <cuda_runtime_api.h>
+#include <cassert>
+#include <gsl/span>
+
+namespace trt_ep {
+
+void CUDA_RETURN_IF_ERROR(cudaError_t res);
+
+/*static*/
+bool ORT_API_CALL TRTEpDataTransfer::CanCopyImpl(const OrtDataTransferImpl* this_ptr,
+                                                 const OrtMemoryDevice* src_memory_device,
+                                                 const OrtMemoryDevice* dst_memory_device) noexcept {
+  auto& impl = *static_cast<const TRTEpDataTransfer*>(this_ptr);
+
+  // logic copied from GPUDataTransfer::CanCopy
+  OrtMemoryInfoDeviceType src_type = impl.ep_api.MemoryDevice_GetDeviceType(src_memory_device);
+  OrtMemoryInfoDeviceType dst_type = impl.ep_api.MemoryDevice_GetDeviceType(dst_memory_device);
+  auto src_vendor_id = impl.ep_api.MemoryDevice_GetVendorId(src_memory_device);
+  auto dst_vendor_id = impl.ep_api.MemoryDevice_GetVendorId(dst_memory_device);
+
+  // 0x10DE is the PCI vendor ID for NVIDIA
+  constexpr uint32_t nvidia_vendor_id = 0x10DE;
+
+  // Reject if GPU device is not NVIDIA
+  if ((src_type == OrtMemoryInfoDeviceType_GPU && src_vendor_id != nvidia_vendor_id) ||
+      (dst_type == OrtMemoryInfoDeviceType_GPU && dst_vendor_id != nvidia_vendor_id)) {
+    return false;
+  }
+
+  // copy must be GPU to GPU or between GPU and CPU
+  return (src_type == OrtMemoryInfoDeviceType_GPU && dst_type == OrtMemoryInfoDeviceType_GPU) ||
+         (src_type == OrtMemoryInfoDeviceType_GPU && dst_type == OrtMemoryInfoDeviceType_CPU) ||
+         (src_type == OrtMemoryInfoDeviceType_CPU && dst_type == OrtMemoryInfoDeviceType_GPU);
+}
+
+// function to copy one or more tensors.
+// implementation can optionally use async copy if a stream is available for the input.
+/*static*/
+OrtStatus* ORT_API_CALL TRTEpDataTransfer::CopyTensorsImpl(OrtDataTransferImpl* this_ptr,
+                                                           const OrtValue** src_tensors_ptr,
+                                                           OrtValue** dst_tensors_ptr,
+                                                           OrtSyncStream** streams_ptr,
+                                                           size_t num_tensors) noexcept {
+  auto& impl = *static_cast<TRTEpDataTransfer*>(this_ptr);
+
+  auto src_tensors = gsl::make_span<const OrtValue*>(src_tensors_ptr, num_tensors);
+  auto dst_tensors = gsl::make_span<OrtValue*>(dst_tensors_ptr, num_tensors);
+  auto streams = gsl::make_span<OrtSyncStream*>(streams_ptr, num_tensors);
+
+  for (size_t i = 0; i < num_tensors; ++i) {
+    // NOTE: Stream support will be a separate PR. ignore teh streams_ptr values for now
+
+    const OrtMemoryDevice* src_device = nullptr;
+    const OrtMemoryDevice* dst_device = nullptr;
+    src_device = impl.ep_api.Value_GetMemoryDevice(src_tensors[i]);
+    dst_device = impl.ep_api.Value_GetMemoryDevice(dst_tensors[i]);
+
+    OrtMemoryInfoDeviceType src_device_type = impl.ep_api.MemoryDevice_GetDeviceType(src_device);
+    OrtMemoryInfoDeviceType dst_device_type = impl.ep_api.MemoryDevice_GetDeviceType(dst_device);
+    OrtDeviceMemoryType src_mem_type = impl.ep_api.MemoryDevice_GetMemoryType(src_device);
+    OrtDeviceMemoryType dst_mem_type = impl.ep_api.MemoryDevice_GetMemoryType(dst_device);
+    bool copy_involves_pinned_memory = src_mem_type == OrtDeviceMemoryType_HOST_ACCESSIBLE ||
+                                       dst_mem_type == OrtDeviceMemoryType_HOST_ACCESSIBLE;
+
+    const void* src_data = nullptr;
+    void* dst_data = nullptr;
+    RETURN_IF_ERROR(impl.ort_api.GetTensorData(src_tensors[i], &src_data));
+    RETURN_IF_ERROR(impl.ort_api.GetTensorMutableData(dst_tensors[i], &dst_data));
+
+    size_t bytes = 0;
+    RETURN_IF_ERROR(impl.ort_api.GetTensorSizeInBytes(src_tensors[i], &bytes));
+
+    // for the sync version of memcpy, launch to cuda default stream
+    if (dst_device_type == OrtMemoryInfoDeviceType_GPU) {
+      if (src_device_type == OrtMemoryInfoDeviceType_GPU) {
+        // GPU -> GPU
+        // Copy only if the two addresses are different and bytes > 0.
+        if (dst_data != src_data && bytes > 0) {
+          CUDA_RETURN_IF_ERROR(cudaMemcpy(dst_data, src_data, bytes, cudaMemcpyDeviceToDevice));
+          // For device memory to device memory copy, no host-side synchronization is performed by cudaMemcpy.
+          // see https://docs.nvidia.com/cuda/cuda-runtime-api/api-sync-behavior.html
+          CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(nullptr));
+        }
+      } else {
+        // CPU -> GPU, this is blocking
+        CUDA_RETURN_IF_ERROR(cudaMemcpy(dst_data, src_data, bytes, cudaMemcpyHostToDevice));
+        if (src_mem_type != OrtDeviceMemoryType_HOST_ACCESSIBLE) {
+          // For cudaMemcpy from pageable host memory to device memory, DMA to final destination may not have completed.
+          // see https://docs.nvidia.com/cuda/cuda-runtime-api/api-sync-behavior.html
+          CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(nullptr));
+        }
+      }
+    } else if (src_device_type == OrtMemoryInfoDeviceType_GPU) {
+      // GPU -> CPU, this is blocking
+      CUDA_RETURN_IF_ERROR(cudaMemcpy(dst_data, src_data, bytes, cudaMemcpyDeviceToHost));
+    } else {
+      // CPU -> CPU involves copy to/from pinned memory and a synchronize may be required first
+      // ORT_ENFORCE(dst_data != src_data);
+      memcpy(dst_data, src_data, bytes);
+    }
+  }
+
+  return nullptr;
+}
+
+/*static*/
+void ORT_API_CALL TRTEpDataTransfer::ReleaseImpl(OrtDataTransferImpl* this_ptr) noexcept {
+  // In our setup the factory owns a shared ExampleDataTransfer instance so it will do the cleanup, and we ignore
+  // the call to Release from the plugin_ep::DataTransfer dtor (see /onnxruntime/core/framework/plugin_data_transfer.h)
+  //
+  // If you create a new instance on each call to OrtEpFactory::CreateDataTransfer you call `delete` here
+  // delete static_cast<TRTEpDataTransfer*>(this_ptr);
+  ;
+}
+}  // namespace trt_ep
